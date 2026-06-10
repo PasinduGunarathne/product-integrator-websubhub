@@ -52,7 +52,8 @@ isolated function processSubscription(websubhub:VerifiedSubscription subscriptio
         return;
     }
     if isMarkingSubscriptionAsStale {
-        log:printDebug(string `Subscriber ${subscriberId} has been marked as stale, hence not starting the consumer`);
+        log:printWarn("Subscription has been marked as stale; no consumer will be started until the subscriber re-subscribes",
+            subscriberId = subscriberId, topic = subscription.hubTopic, callback = subscription.hubCallback);
         return;
     }
 

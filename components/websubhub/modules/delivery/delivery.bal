@@ -20,11 +20,17 @@ import websubhub.connections as conn;
 import websubhub.persistence as persist;
 import websubhub.state;
 
+import ballerina/log;
 import ballerina/websubhub;
 
 import wso2/messagestore.api as storeapi;
 
 const NUMBER_OF_DEFAULT_ASYNC_WORKERS = 1;
+
+// Maximum number of consecutive receive() errors before a subscription is marked stale.
+// A single transient error (e.g. a cloud network glitch) does not immediately degrade the
+// subscription — the consumer must fail this many times in a row without a successful receive.
+const int MAX_CONSECUTIVE_RECEIVE_ERRORS = 5;
 
 # Distributes a content notification to the specified subscriber using an async worker.
 # This function delivers the published content update associated with the
@@ -44,19 +50,34 @@ isolated function startDispatchTask(websubhub:VerifiedSubscription subscription)
     string topic = subscription.hubTopic;
     storeapi:Consumer consumerEp = check conn:createConsumer(subscription);
     Dispatcher contentDispatcher = check createDispatcher(subscription, consumerEp);
+    int consecutiveReceiveErrors = 0;
     do {
         while true {
-            storeapi:Message? message = check consumerEp->receive();
+            storeapi:Message|error? receiveResult = consumerEp->receive();
+            if receiveResult is error {
+                consecutiveReceiveErrors += 1;
+                if consecutiveReceiveErrors < MAX_CONSECUTIVE_RECEIVE_ERRORS {
+                    log:printWarn("Transient error while receiving from message store, will retry",
+                        'error = receiveResult,
+                        topic = topic,
+                        subscriberId = subscriberId,
+                        attempt = consecutiveReceiveErrors,
+                        maxAttempts = MAX_CONSECUTIVE_RECEIVE_ERRORS);
+                    continue;
+                }
+                // Max consecutive receive errors reached — propagate to the on fail block.
+                fail receiveResult;
+            }
+            consecutiveReceiveErrors = 0;
             if !isValidConsumer(subscription.hubTopic, subscriberId) {
                 fail error common:InvalidSubscriptionError(
                     string `Subscription or the topic is invalid`, topic = topic, subscriberId = subscriberId
                 );
             }
-            if message is () {
+            if receiveResult is () {
                 continue;
             }
-
-            check contentDispatcher->notifyContentDistribution(message);
+            check contentDispatcher->notifyContentDistribution(receiveResult);
         }
     } on fail var e {
         common:logRecoverableError("Error occurred while sending notification to subscriber", e);
@@ -111,6 +132,8 @@ isolated function startDispatchTask(websubhub:VerifiedSubscription subscription)
         if result is error {
             common:logRecoverableError("Error occurred while gracefully closing message store consumer", result);
         }
+        log:printWarn("Marking subscription as stale; the subscriber will not receive further messages until it re-subscribes",
+            topic = topic, subscriberId = subscriberId, callback = subscription.hubCallback);
         // Persist the subscription as a `stale` subscription whenever the content delivery fails
         common:StaleSubscription staleSubscription = {
             ...subscription

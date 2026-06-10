@@ -19,10 +19,17 @@ import websubhub.config;
 import websubhub.connections as conn;
 
 import ballerina/http;
+import ballerina/lang.runtime;
 import ballerina/lang.value;
+import ballerina/log;
 import ballerina/websubhub;
 
 import wso2/messagestore.api as storeapi;
+
+// Initial delay (seconds) before the first restart of the hub-state update worker.
+// Doubles on each consecutive failure, capped at HUB_STATE_WORKER_MAX_RETRY_DELAY.
+const decimal HUB_STATE_WORKER_INITIAL_RETRY_DELAY = 5.0;
+const decimal HUB_STATE_WORKER_MAX_RETRY_DELAY = 60.0;
 
 function initializeHubState() returns error? {
     http:Client stateSnapshot;
@@ -41,18 +48,61 @@ function initializeHubState() returns error? {
         common:SystemStateSnapshot systemStateSnapshot = check stateSnapshot->/;
         processWebsubTopicsSnapshotState(systemStateSnapshot.topics);
         check processWebsubSubscriptionsSnapshotState(systemStateSnapshot.subscriptions);
-        // Start hub-state update worker
-        _ = start updateHubState();
+        // Start hub-state update worker — wrapped in a restart loop so that transient
+        // broker failures (e.g. a frozen TCP connection) do not permanently stop the hub
+        // from seeing state-change events.
+        _ = start startHubStateUpdateWorker();
     } on fail error httpError {
         common:logFatalError("Error occurred while initializing the hub-state using the latest state-snapshot", httpError);
         return httpError;
     }
 }
 
-function updateHubState() returns error? {
+# Starts the hub-state update worker in a resilient restart loop. On any failure the worker
+# logs an ERROR, closes the consumer, waits with exponential backoff (capped at
+# HUB_STATE_WORKER_MAX_RETRY_DELAY seconds), creates a fresh consumer, and retries. This
+# prevents a transient broker connection failure (e.g. a frozen cloud TCP link) from
+# permanently stopping the hub from processing state-change events.
+function startHubStateUpdateWorker() {
+    decimal delay = HUB_STATE_WORKER_INITIAL_RETRY_DELAY;
+    while true {
+        storeapi:Consumer|error eventsConsumer = conn:createWebSubEventsConsumer();
+        if eventsConsumer is error {
+            log:printError("Failed to initialize hub-state events consumer, retrying after delay",
+                'error = eventsConsumer, retryDelaySeconds = delay);
+            runtime:sleep(delay);
+            if delay < HUB_STATE_WORKER_MAX_RETRY_DELAY {
+                delay = delay * 2.0d;
+            }
+            continue;
+        }
+        // Reset backoff on a successful consumer creation.
+        delay = HUB_STATE_WORKER_INITIAL_RETRY_DELAY;
+        error? result = updateHubState(eventsConsumer);
+        if result is error {
+            log:printError("Hub-state update worker terminated unexpectedly, restarting after delay",
+                'error = result, retryDelaySeconds = delay);
+        } else {
+            // updateHubState should never return () under normal operation.
+            log:printWarn("Hub-state update worker exited without error, restarting");
+        }
+        runtime:sleep(delay);
+        if delay < HUB_STATE_WORKER_MAX_RETRY_DELAY {
+            delay = delay * 2.0d;
+        }
+    }
+}
+
+# Runs the hub-state event consume loop using the provided consumer. Returns an error if the
+# loop terminates due to a broker failure; the caller (startHubStateUpdateWorker) is
+# responsible for closing the consumer and retrying with a fresh connection.
+#
+# + eventsConsumer - The consumer to use for reading hub-state events
+# + return - An error if the consume loop fails, or `()` on unexpected clean exit
+function updateHubState(storeapi:Consumer eventsConsumer) returns error? {
     do {
         while true {
-            storeapi:Message? message = check conn:websubEventsConsumer->receive();
+            storeapi:Message? message = check eventsConsumer->receive();
             if message is () {
                 continue;
             }
@@ -61,14 +111,14 @@ function updateHubState() returns error? {
             error? result = processStateUpdateEvent(lastPersistedData);
             if result is error {
                 common:logFatalError("Error occurred while processing state-update event", result);
-                check conn:websubEventsConsumer->nack(message);
+                check eventsConsumer->nack(message);
                 check result;
             } else {
-                check conn:websubEventsConsumer->ack(message);
+                check eventsConsumer->ack(message);
             }
         }
     } on fail error e {
-        check conn:websubEventsConsumer->close();
+        check eventsConsumer->close();
         return e;
     }
 }

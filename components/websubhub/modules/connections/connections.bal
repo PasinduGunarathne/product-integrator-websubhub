@@ -32,10 +32,12 @@ function initStatePersistProducer() returns storeapi:Producer|error {
     return store:createProducer(clientId, config:store);
 }
 
-// Consumer which reads the persisted subscriber details
-public final storeapi:Consumer websubEventsConsumer = check initWebSubEventsConsumer();
-
-function initWebSubEventsConsumer() returns storeapi:Consumer|error {
+# Creates a fresh `store:Consumer` for hub-state events. Called once at startup and again on
+# each restart of the hub-state update worker so that a new broker connection is established
+# after a failure — the previous consumer is closed before this is called.
+#
+# + return - A `store:Consumer` for the hub-state events topic, or an `error` if the operation fails
+public function createWebSubEventsConsumer() returns storeapi:Consumer|error {
     string websubEventsConsumerId = string `${config:state.events.consumerIdPrefix}-${config:serverId}`;
     check admin:createWebSubEventsSubscription(config:state.events.topic, websubEventsConsumerId);
     return store:createConsumer(config:state.events.topic, websubEventsConsumerId, config:store, true);
